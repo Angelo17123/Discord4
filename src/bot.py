@@ -44,8 +44,11 @@ async def on_ready():
     client.loop.create_task(monitor_voice())
     await join_voice_channel(CHANNEL_ID_INT)
 
+MAX_VOICE_RETRIES = 5
+voice_retry_count = 0
+
 async def join_voice_channel(channel_id):
-    global reconnecting
+    global reconnecting, voice_retry_count
 
     if reconnecting:
         return
@@ -68,18 +71,25 @@ async def join_voice_channel(channel_id):
                 await guild.voice_client.disconnect(force=True)
             except Exception:
                 pass
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
         voice = await channel.connect(
             self_mute=True,
             self_deaf=True,
             timeout=30,
-            reconnect=True
+            reconnect=False
         )
         print(f'Conectado al canal de voz: {channel.name}')
+        voice_retry_count = 0
     except Exception as e:
         print(f'Error al conectar al canal de voz: {e}')
-        await asyncio.sleep(5)
+        voice_retry_count += 1
+        if voice_retry_count >= MAX_VOICE_RETRIES:
+            print(f'Maximo de reintentos ({MAX_VOICE_RETRIES}) alcanzado. Esperando 60s antes de reintentar...')
+            await asyncio.sleep(60)
+            voice_retry_count = 0
+        else:
+            await asyncio.sleep(5 * voice_retry_count)
         reconnecting = False
         await join_voice_channel(channel_id)
     finally:
@@ -118,10 +128,13 @@ async def on_voice_state_update(member, before, after):
 async def monitor_voice():
     await client.wait_until_ready()
     while not client.is_closed():
+        await asyncio.sleep(60)
         guild = client.get_guild(GUILD_ID_INT)
         if guild and guild.voice_client and guild.voice_client.is_connected():
             print(f'Conexion de voz activa en: {guild.voice_client.channel.name}')
-        await asyncio.sleep(60)
+        elif not reconnecting:
+            print('Voz desconectada detectada por monitor. Reconectando...')
+            await join_voice_channel(current_channel_id)
 
 if __name__ == '__main__':
     start_webserver()
