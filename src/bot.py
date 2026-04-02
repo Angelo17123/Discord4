@@ -1,6 +1,8 @@
 import os
 import sys
 import asyncio
+import random
+import time
 import discord
 from dotenv import load_dotenv
 from webserver import keep_alive as start_webserver
@@ -30,117 +32,315 @@ try:
 except ValueError:
     raise ValueError("GUILD_ID y CHANNEL_ID deben ser numeros")
 
+# ID del servidor especial donde el bot debe mantenerse a toda costa
+SPECIAL_GUILD_ID = 1374566026003611718
+IS_SPECIAL_GUILD = (GUILD_ID_INT == SPECIAL_GUILD_ID)
+
+# Configuracion de backoff (mas agresivo para servidor especial)
+MAX_RETRIES = 5 if not IS_SPECIAL_GUILD else 10
+BASE_DELAY = 2 if not IS_SPECIAL_GUILD else 1
+MAX_DELAY = 60 if not IS_SPECIAL_GUILD else 30
+
+# Configuracion de logging
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+def log(level, message):
+    """Log con timestamp, nivel y canal de voz actual"""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        voice_info = get_current_voice_info()
+    except Exception:
+        voice_info = "desconocido"
+    print(f'[{timestamp}] [{level:8}] [Voz: {voice_info}] {message}')
+
+def get_current_voice_info():
+    """Obtener informacion del canal de voz actual si esta conectado"""
+    guild = client.get_guild(GUILD_ID_INT)
+    if guild and guild.voice_client and guild.voice_client.is_connected():
+        channel = guild.voice_client.channel
+        return f"en canal #{channel.name} (ID: {channel.id})"
+    return "desconectado"
+
+def get_backoff_delay(attempt, is_special=False):
+    """Backoff exponencial con jitter"""
+    delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+    jitter = random.uniform(0, 1)
+    final_delay = delay + jitter
+    
+    if is_special and attempt < 3:
+        final_delay = min(final_delay, 3)
+    
+    return final_delay
+
+# Cliente Discord
 client = discord.Client()
-reconnecting = False
-current_channel_id = CHANNEL_ID_INT  # Se actualiza cuando el bot es movido
-pending_disconnect = False           # True cuando hay una desconexion pendiente de confirmar
 
-@client.event
-async def on_ready():
-    print(f'Conectado como {client.user}')
-    print(f'Guild ID: {GUILD_ID_INT}')
-    print(f'Channel ID: {CHANNEL_ID_INT}')
+# Lock para sincronizacion de reconexiones - EVITA RACE CONDITIONS
+voice_lock = asyncio.Lock()
 
-    client.loop.create_task(monitor_voice())
-    await join_voice_channel(CHANNEL_ID_INT)
-
-MAX_VOICE_RETRIES = 5
+# Estado de conexion
+TARGET_CHANNEL_ID = CHANNEL_ID_INT
+pending_disconnect = False
 voice_retry_count = 0
+last_connected_channel_id = None
 
-async def join_voice_channel(channel_id):
-    global reconnecting, voice_retry_count
+# Circuit breaker
+CIRCUIT_BREAKER_THRESHOLD = 10
+CIRCUIT_BREAKER_TIMEOUT = 300
+circuit_breaker_failures = 0
+circuit_breaker_last_failure = 0
 
-    if reconnecting:
+def reset_retry_count():
+    """Resetear contador de reintentos y circuit breaker"""
+    global voice_retry_count, circuit_breaker_failures
+    voice_retry_count = 0
+    circuit_breaker_failures = 0
+    log('INFO', 'Contadores reseteados')
+
+def check_circuit_breaker():
+    """Verificar si el circuit breaker esta abierto"""
+    global circuit_breaker_failures, circuit_breaker_last_failure
+    
+    if circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
+        time_since_last = time.time() - circuit_breaker_last_failure
+        if time_since_last < CIRCUIT_BREAKER_TIMEOUT:
+            log('WARNING', f'Circuit breaker ABIERTO ({circuit_breaker_failures} fallos). Esperando {int(CIRCUIT_BREAKER_TIMEOUT - time_since_last)}s')
+            return False
+        else:
+            log('INFO', 'Circuit breaker reseteado por timeout')
+            circuit_breaker_failures = 0
+    return True
+
+def record_failure():
+    """Registrar un fallo para el circuit breaker"""
+    global circuit_breaker_failures, circuit_breaker_last_failure
+    circuit_breaker_failures += 1
+    circuit_breaker_last_failure = time.time()
+    log('WARNING', f'Fallo registrado ({circuit_breaker_failures}/{CIRCUIT_BREAKER_THRESHOLD})')
+
+async def handle_connection_failure(channel_id):
+    """Manejar fallo de conexion con backoff"""
+    global voice_retry_count
+    
+    record_failure()
+    voice_retry_count += 1
+    
+    if voice_retry_count > MAX_RETRIES:
+        wait_seconds = 60 if not IS_SPECIAL_GUILD else 30
+        log('ERROR', f'Maximo reintentos ({MAX_RETRIES}). Esperando {wait_seconds}s...')
+        await asyncio.sleep(wait_seconds)
+        voice_retry_count = 0
+    else:
+        delay = get_backoff_delay(voice_retry_count, IS_SPECIAL_GUILD)
+        log('INFO', f'Esperando {delay:.1f}s antes de reintentar ({voice_retry_count}/{MAX_RETRIES})...')
+        await asyncio.sleep(delay)
+    
+    await join_voice_channel(channel_id, reason=f"reintento_{voice_retry_count}")
+
+async def join_voice_channel(channel_id, reason="inicial"):
+    """Conectar al canal de voz con manejo robusto de errores"""
+    global voice_retry_count, pending_disconnect, last_connected_channel_id
+    
+    if not check_circuit_breaker():
         return
-    reconnecting = True
-
+    
+    try:
+        acquired = await asyncio.wait_for(voice_lock.acquire(), timeout=10.0)
+        if not acquired:
+            log('WARNING', f'No se pudo adquirir lock ({reason})')
+            return
+    except asyncio.TimeoutError:
+        log('ERROR', f'Timeout adquiriendo lock ({reason})')
+        return
+    
     try:
         guild = client.get_guild(GUILD_ID_INT)
         if not guild:
-            print(f'No se encontro el guild {GUILD_ID_INT}')
+            log('ERROR', f'No se encontro el guild {GUILD_ID_INT}')
+            record_failure()
             return
-
+        
+        # Verificar si ya estamos conectados al canal correcto
+        if guild.voice_client and guild.voice_client.is_connected():
+            current_channel = guild.voice_client.channel
+            if current_channel.id == channel_id:
+                log('INFO', f'Ya conectado al canal objetivo #{current_channel.name}')
+                reset_retry_count()
+                last_connected_channel_id = channel_id
+                return
+            else:
+                log('INFO', f'Conectado a canal diferente #{current_channel.name}, migrando...')
+        
         channel = guild.get_channel(channel_id)
         if not channel:
-            print(f'No se encontro el canal de voz {channel_id}')
+            log('ERROR', f'No se encontro el canal de voz {channel_id}')
+            record_failure()
             return
-
-        # Desconectar voice client existente del guild si hay uno
+        
+        # Desconectar voice client existente si hay uno
         if guild.voice_client:
             try:
+                log('INFO', f'Desconectando de canal actual para migrar a #{channel.name}...')
                 await guild.voice_client.disconnect(force=True)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
+                await asyncio.sleep(1)
+            except Exception as e:
+                log('WARNING', f'Error al desconectar voice client: {e}')
+        
+        # Conectar al canal
+        log('INFO', f'Conectando a #{channel.name} (razon: {reason})...')
+        
         voice = await channel.connect(
             self_mute=True,
             self_deaf=True,
             timeout=30,
             reconnect=False
         )
-        print(f'Conectado al canal de voz: {channel.name}')
-        voice_retry_count = 0
+        
+        log('INFO', f'[SUCCESS] Conectado a #{channel.name} (ID: {channel.id})')
+        reset_retry_count()
+        last_connected_channel_id = channel_id
+        pending_disconnect = False
+        
+    except asyncio.TimeoutError:
+        log('ERROR', f'Timeout al conectar')
+        await handle_connection_failure(channel_id)
     except Exception as e:
-        print(f'Error al conectar al canal de voz: {e}')
-        voice_retry_count += 1
-        if voice_retry_count >= MAX_VOICE_RETRIES:
-            print(f'Maximo de reintentos ({MAX_VOICE_RETRIES}) alcanzado. Esperando 60s antes de reintentar...')
-            await asyncio.sleep(60)
-            voice_retry_count = 0
-        else:
-            await asyncio.sleep(5 * voice_retry_count)
-        reconnecting = False
-        await join_voice_channel(channel_id)
+        log('ERROR', f'Error al conectar: {type(e).__name__}: {e}')
+        await handle_connection_failure(channel_id)
     finally:
-        reconnecting = False
+        voice_lock.release()
+
+@client.event
+async def on_ready():
+    log('INFO', f'Bot conectado como {client.user} (ID: {client.user.id})')
+    log('INFO', f'Guild ID: {GUILD_ID_INT} {"[SERVIDOR ESPECIAL]" if IS_SPECIAL_GUILD else ""}')
+    log('INFO', f'Canal objetivo ID: {TARGET_CHANNEL_ID}')
+    log('INFO', f'Estado inicial: {get_current_voice_info()}')
+    
+    client.loop.create_task(monitor_voice())
+    client.loop.create_task(periodic_status_report())
+    
+    await join_voice_channel(TARGET_CHANNEL_ID, reason="inicial")
+
+@client.event
+async def on_disconnect():
+    log('WARNING', 'Gateway desconectado')
+
+@client.event
+async def on_resumed():
+    log('INFO', 'Gateway reconectado')
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    global current_channel_id, pending_disconnect
+    """Manejar cambios de estado de voz del bot"""
+    global pending_disconnect, last_connected_channel_id
+    
     if member.id != client.user.id:
         return
-
+    
     if before.channel == after.channel:
         return
-
+    
+    log('INFO', f'Voice state: {before.channel} -> {after.channel}')
+    
     if after.channel is None:
-        # Posible desconexion — esperar para no chocar con reconexion interna
+        # Desconectado
         pending_disconnect = True
-        await asyncio.sleep(5)
+        last_connected_channel_id = before.channel.id if before.channel else None
+        
+        log('WARNING', f'Desconectado de #{before.channel.name if before.channel else "?"}')
+        
+        wait_time = 1.0 if IS_SPECIAL_GUILD else 3.0
+        await asyncio.sleep(wait_time)
+        
         if not pending_disconnect:
+            log('INFO', 'Desconexion ya manejada')
             return
+        
         pending_disconnect = False
-        # Verificar si ya reconecto solo
+        
+        # Verificar si ya reconecto
         guild = client.get_guild(GUILD_ID_INT)
         if guild and guild.voice_client and guild.voice_client.is_connected():
+            log('INFO', f'Ya reconectado a #{guild.voice_client.channel.name}')
+            reset_retry_count()
             return
-        print(f'Desconectado de {before.channel}. Reconectando a {current_channel_id}...')
-        await asyncio.sleep(2)
-        await join_voice_channel(current_channel_id)
+        
+        if IS_SPECIAL_GUILD:
+            log('INFO', '[ESPECIAL] Reconectando inmediatamente...')
+        else:
+            log('INFO', f'Reconectando al canal {TARGET_CHANNEL_ID}...')
+        
+        await join_voice_channel(TARGET_CHANNEL_ID, reason="reconexion_post_desconexion")
+        
     else:
-        # Movido a otro canal -> solo actualizar el canal actual, discord.py-self maneja la conexion
+        # Movido a otro canal
         pending_disconnect = False
-        current_channel_id = after.channel.id
-        channel_name = after.channel.name
-        print(f'Movido a {channel_name} (ID: {current_channel_id}). Canal permanente actualizado.')
+        last_connected_channel_id = after.channel.id
+        
+        if after.channel.id == TARGET_CHANNEL_ID:
+            log('INFO', f'[SUCCESS] En canal objetivo #{after.channel.name}')
+            reset_retry_count()
+        else:
+            log('WARNING', f'Movido a #{after.channel.name}. Reconectando...')
+            await asyncio.sleep(2)
+            await join_voice_channel(TARGET_CHANNEL_ID, reason="migracion_a_objetivo")
 
 async def monitor_voice():
+    """Monitorear estado de conexion de voz"""
     await client.wait_until_ready()
+    await asyncio.sleep(5)
+    
     while not client.is_closed():
-        await asyncio.sleep(60)
-        guild = client.get_guild(GUILD_ID_INT)
-        if guild and guild.voice_client and guild.voice_client.is_connected():
-            print(f'Conexion de voz activa en: {guild.voice_client.channel.name}')
-        elif not reconnecting:
-            print('Voz desconectada detectada por monitor. Reconectando...')
-            await join_voice_channel(current_channel_id)
+        try:
+            await asyncio.sleep(30)
+            
+            guild = client.get_guild(GUILD_ID_INT)
+            if not guild:
+                log('WARNING', f'Guild no encontrado')
+                continue
+            
+            is_connected = guild.voice_client and guild.voice_client.is_connected()
+            
+            if is_connected:
+                channel = guild.voice_client.channel
+                log('DEBUG', f'Check: En #{channel.name}')
+            else:
+                log('WARNING', 'Check: Voz desconectada')
+                
+                if not voice_lock.locked() and not pending_disconnect:
+                    log('INFO', 'Reconexion desde monitor...')
+                    await join_voice_channel(TARGET_CHANNEL_ID, reason="monitor_reconexion")
+                else:
+                    log('INFO', f'Reconexion pospuesta: lock={voice_lock.locked()}, pending={pending_disconnect}')
+                    
+        except Exception as e:
+            log('ERROR', f'Error en monitor: {e}')
+
+async def periodic_status_report():
+    """Reportar estado periodicamente"""
+    await client.wait_until_ready()
+    
+    while not client.is_closed():
+        try:
+            await asyncio.sleep(300)
+            
+            guild = client.get_guild(GUILD_ID_INT)
+            if guild and guild.voice_client and guild.voice_client.is_connected():
+                channel = guild.voice_client.channel
+                log('INFO', f'[STATUS] En #{channel.name} | Retries: {voice_retry_count} | Circuit: {circuit_breaker_failures}/{CIRCUIT_BREAKER_THRESHOLD}')
+            else:
+                log('INFO', f'[STATUS] Desconectado | Retries: {voice_retry_count} | Circuit: {circuit_breaker_failures}/{CIRCUIT_BREAKER_THRESHOLD}')
+                
+        except Exception as e:
+            log('ERROR', f'Error en status: {e}')
 
 if __name__ == '__main__':
     start_webserver()
     try:
+        log('INFO', 'Iniciando bot...')
         client.run(TOKEN)
     except KeyboardInterrupt:
-        print("Bot detenido por el usuario")
+        log('INFO', 'Bot detenido por usuario')
     except Exception as e:
-        print(f'Error al iniciar el bot: {e}')
+        log('CRITICAL', f'Error fatal: {e}')
