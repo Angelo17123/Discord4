@@ -245,6 +245,11 @@ async def on_voice_state_update(member, before, after):
     if before.channel == after.channel:
         return
     
+    # Deshabilitar reconexion interna de discord.py-self en cualquier voice client existente
+    guild = client.get_guild(GUILD_ID_INT)
+    if guild and guild.voice_client:
+        guild.voice_client._reconnect = False
+    
     log('INFO', f'Voice state: {before.channel} -> {after.channel}')
     
     if after.channel is None:
@@ -298,6 +303,10 @@ async def monitor_voice():
             if not guild:
                 log('WARNING', f'Guild no encontrado')
                 continue
+            
+            # Deshabilitar reconexion interna de discord.py-self
+            if guild.voice_client:
+                guild.voice_client._reconnect = False
             
             is_connected = guild.voice_client and guild.voice_client.is_connected()
             
