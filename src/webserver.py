@@ -1,3 +1,4 @@
+import os
 from flask import Flask
 from threading import Thread
 
@@ -8,7 +9,8 @@ def home():
     return 'Bot activo.'
 
 def keep_alive():
-    t = Thread(target=lambda: app.run(host='0.0.0.0', port=5000))
+    port = int(os.environ.get('PORT', 5000))
+    t = Thread(target=lambda: app.run(host='0.0.0.0', port=port))
     t.daemon = True
     t.start()
-    print('Servidor web activo en http://localhost:5000')
+    print(f'Servidor web activo en http://localhost:{port}')
