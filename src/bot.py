@@ -196,6 +196,10 @@ async def join_voice_channel(channel_id, reason="inicial"):
             reconnect=False
         )
         
+        # Deshabilitar reconexion interna de discord.py-self para evitar conflictos
+        if guild.voice_client:
+            guild.voice_client._reconnect = False
+        
         log('INFO', f'[SUCCESS] Conectado a #{channel.name} (ID: {channel.id})')
         reset_retry_count()
         last_connected_channel_id = channel_id
