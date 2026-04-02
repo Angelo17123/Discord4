@@ -237,7 +237,7 @@ async def on_resumed():
 @client.event
 async def on_voice_state_update(member, before, after):
     """Manejar cambios de estado de voz del bot"""
-    global pending_disconnect, last_connected_channel_id
+    global pending_disconnect, last_connected_channel_id, TARGET_CHANNEL_ID
     
     if member.id != client.user.id:
         return
@@ -278,17 +278,12 @@ async def on_voice_state_update(member, before, after):
         await join_voice_channel(TARGET_CHANNEL_ID, reason="reconexion_post_desconexion")
         
     else:
-        # Movido a otro canal
+        # Movido a otro canal - quedarse donde lo movieron
         pending_disconnect = False
         last_connected_channel_id = after.channel.id
+        TARGET_CHANNEL_ID = after.channel.id
         
-        if after.channel.id == TARGET_CHANNEL_ID:
-            log('INFO', f'[SUCCESS] En canal objetivo #{after.channel.name}')
-            reset_retry_count()
-        else:
-            log('WARNING', f'Movido a #{after.channel.name}. Reconectando...')
-            await asyncio.sleep(2)
-            await join_voice_channel(TARGET_CHANNEL_ID, reason="migracion_a_objetivo")
+        log('INFO', f'Movido a #{after.channel.name} - nuevo canal objetivo')
 
 async def monitor_voice():
     """Monitorear estado de conexion de voz"""
