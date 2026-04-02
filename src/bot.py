@@ -281,13 +281,20 @@ async def on_voice_state_update(member, before, after):
         last_connected_channel_id = after.channel.id
         TARGET_CHANNEL_ID = after.channel.id
         
-        # Cancelar el poll loop interno de discord.py-self para evitar reconexion automatica
+        # Prevenir reconexion interna de discord.py-self al mover de canal
         if guild and guild.voice_client and hasattr(guild.voice_client, '_connection'):
             conn = guild.voice_client._connection
+            # Cancelar el task de reconexion (_connector) y el poll loop (_runner)
+            if conn._connector:
+                conn._connector.cancel()
+                conn._connector = None
             if conn._runner:
                 conn._runner.cancel()
                 conn._runner = None
+            # Marcar como desconectado para que _poll_voice_ws no reconecte
             conn._disconnected.set()
+            # Marcar que esperamos el disconnect para que voice_state_update no llame disconnect()
+            conn._expecting_disconnect = True
         
         log('INFO', f'Movido a #{after.channel.name} - nuevo canal objetivo')
 
