@@ -1,7 +1,13 @@
 import os
+import sys
 import asyncio
 import discord
 from dotenv import load_dotenv
+from webserver import keep_alive as start_webserver
+
+# Forzar SelectorEventLoop en Windows para evitar WinError 10038 con asyncio ProactorEventLoop
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Cargar variables de entorno desde la raiz del proyecto
 env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
@@ -35,7 +41,7 @@ async def on_ready():
     print(f'Guild ID: {GUILD_ID_INT}')
     print(f'Channel ID: {CHANNEL_ID_INT}')
 
-    client.loop.create_task(keep_alive())
+    client.loop.create_task(monitor_voice())
     await join_voice_channel(CHANNEL_ID_INT)
 
 async def join_voice_channel(channel_id):
@@ -89,24 +95,27 @@ async def on_voice_state_update(member, before, after):
         return
 
     if after.channel is None:
-        # Posible desconexion — esperar un momento por si es un movimiento de canal
+        # Posible desconexion — esperar para no chocar con reconexion interna
         pending_disconnect = True
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
         if not pending_disconnect:
-            # Fue un movimiento, ya se manejo en el otro evento
             return
         pending_disconnect = False
-        # Desconexion real -> reconectar al canal actual
+        # Verificar si ya reconecto solo
+        guild = client.get_guild(GUILD_ID_INT)
+        if guild and guild.voice_client and guild.voice_client.is_connected():
+            return
         print(f'Desconectado de {before.channel}. Reconectando a {current_channel_id}...')
         await asyncio.sleep(2)
         await join_voice_channel(current_channel_id)
     else:
-        # Movido a otro canal -> cancelar cualquier reconexion pendiente y actualizar canal
+        # Movido a otro canal -> solo actualizar el canal actual, discord.py-self maneja la conexion
         pending_disconnect = False
         current_channel_id = after.channel.id
-        print(f'Movido a {after.channel.name} (ID: {current_channel_id}). Canal permanente actualizado.')
+        channel_name = after.channel.name
+        print(f'Movido a {channel_name} (ID: {current_channel_id}). Canal permanente actualizado.')
 
-async def keep_alive():
+async def monitor_voice():
     await client.wait_until_ready()
     while not client.is_closed():
         guild = client.get_guild(GUILD_ID_INT)
@@ -115,6 +124,7 @@ async def keep_alive():
         await asyncio.sleep(60)
 
 if __name__ == '__main__':
+    start_webserver()
     try:
         client.run(TOKEN)
     except KeyboardInterrupt:
