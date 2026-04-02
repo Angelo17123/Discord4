@@ -4,6 +4,7 @@ import asyncio
 import random
 import time
 import discord
+from discord.voice_state import VoiceConnectionState
 from dotenv import load_dotenv
 from webserver import keep_alive as start_webserver
 
@@ -43,6 +44,37 @@ MAX_DELAY = 60 if not IS_SPECIAL_GUILD else 30
 
 # Configuracion de logging
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Canal objetivo - se actualiza cuando el bot es movido
+TARGET_CHANNEL_ID = CHANNEL_ID_INT
+
+# Monkey-patch de voice_state_update para interceptar movimientos ANTES que discord.py-self
+_original_vs_update = VoiceConnectionState.voice_state_update
+
+async def _patched_voice_state_update(self, data):
+    """Interceptar voice state update para prevenir reconexion al mover de canal"""
+    channel_id = data.get('channel_id')
+    if channel_id is not None:
+        new_channel_id = int(channel_id)
+        if self.voice_client and self.voice_client.channel:
+            current_channel_id = self.voice_client.channel.id
+            if new_channel_id != current_channel_id:
+                # Bot fue movido a otro canal - prevenir reconexion interna
+                global TARGET_CHANNEL_ID
+                TARGET_CHANNEL_ID = new_channel_id
+                self._disconnected.set()
+                self._expecting_disconnect = True
+                if self._runner:
+                    self._runner.cancel()
+                    self._runner = None
+                if self._connector:
+                    self._connector.cancel()
+                    self._connector = None
+                self._update_voice_channel(new_channel_id)
+                return
+    await _original_vs_update(self, data)
+
+VoiceConnectionState.voice_state_update = _patched_voice_state_update
 
 def log(level, message):
     """Log con timestamp, nivel y canal de voz actual"""
@@ -233,7 +265,7 @@ async def on_resumed():
 @client.event
 async def on_voice_state_update(member, before, after):
     """Manejar cambios de estado de voz del bot"""
-    global pending_disconnect, last_connected_channel_id, TARGET_CHANNEL_ID
+    global pending_disconnect, last_connected_channel_id
     
     if member.id != client.user.id:
         return
@@ -276,27 +308,10 @@ async def on_voice_state_update(member, before, after):
         await join_voice_channel(TARGET_CHANNEL_ID, reason="reconexion_post_desconexion")
         
     else:
-        # Movido a otro canal - quedarse donde lo movieron
+        # Movido a otro canal - TARGET_CHANNEL_ID ya fue actualizado por el monkey-patch
         pending_disconnect = False
         last_connected_channel_id = after.channel.id
-        TARGET_CHANNEL_ID = after.channel.id
-        
-        # Prevenir reconexion interna de discord.py-self al mover de canal
-        if guild and guild.voice_client and hasattr(guild.voice_client, '_connection'):
-            conn = guild.voice_client._connection
-            # Cancelar el task de reconexion (_connector) y el poll loop (_runner)
-            if conn._connector:
-                conn._connector.cancel()
-                conn._connector = None
-            if conn._runner:
-                conn._runner.cancel()
-                conn._runner = None
-            # Marcar como desconectado para que _poll_voice_ws no reconecte
-            conn._disconnected.set()
-            # Marcar que esperamos el disconnect para que voice_state_update no llame disconnect()
-            conn._expecting_disconnect = True
-        
-        log('INFO', f'Movido a #{after.channel.name} - nuevo canal objetivo')
+        log('INFO', f'Movido a #{after.channel.name} - nuevo canal objetivo: {TARGET_CHANNEL_ID}')
 
 async def monitor_voice():
     """Monitorear estado de conexion de voz"""
